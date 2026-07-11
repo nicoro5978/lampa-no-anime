@@ -1,18 +1,21 @@
-/* No Anime TMDB — Version 2.3.0 */
+/* No Anime TMDB — Version 2.3.1 */
 
 (function () {
     'use strict';
 
-    if (window.__NO_ANIME_TMDB_ACTIVE__) {
+    var GLOBAL_FLAG = '__NO_ANIME_TMDB_ACTIVE__';
+
+    if (window[GLOBAL_FLAG]) {
         return;
     }
 
-    window.__NO_ANIME_TMDB_ACTIVE__ = true;
+    window[GLOBAL_FLAG] = true;
 
-    var BLOCK_LANGUAGES = Object.create(null);
-    var BLOCK_COUNTRIES = Object.create(null);
-
-    [
+    /*
+     * Заблокированные языки:
+     * Япония, Южная Корея, Индия, Таиланд.
+     */
+    var BLOCKED_LANGUAGES = createLookup([
         'ja',
         'ko',
         'hi',
@@ -25,34 +28,50 @@
         'pa',
         'ur',
         'th'
-    ].forEach(function (code) {
-        BLOCK_LANGUAGES[code] = true;
-    });
+    ]);
 
-    [
+    /*
+     * Заблокированные страны:
+     * Япония, Южная Корея, Индия, Таиланд.
+     */
+    var BLOCKED_COUNTRIES = createLookup([
         'JP',
         'KR',
         'IN',
         'TH'
-    ].forEach(function (code) {
-        BLOCK_COUNTRIES[code] = true;
-    });
+    ]);
 
-    var CYRILLIC_RE = /[А-ЯЁа-яё]/;
+    var CYRILLIC_PATTERN = /[А-ЯЁа-яё]/;
 
-    var BLOCKED_SCRIPT_RE =
+    var BLOCKED_SCRIPT_PATTERN =
         /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\u0900-\u097f\u0980-\u09ff\u0a00-\u0a7f\u0b80-\u0bff\u0c00-\u0c7f\u0c80-\u0cff\u0d00-\u0d7f\u0e00-\u0e7f]/;
 
-    var ANIME_RE =
+    var ANIME_PATTERN =
         /(?:^|[^a-zа-яё])(?:anime|аниме|manga|манга|shonen|shounen|seinen|isekai|otaku|anilibria|crunchyroll)(?:$|[^a-zа-яё])/i;
 
     /*
-     * Состояние используется только для большого каталога,
-     * чтобы удалять дубли между подгружаемыми страницами.
+     * Хранилище показанных карточек для больших каталогов.
+     * Необходимо для удаления дублей между страницами.
      */
     var catalogStates = Object.create(null);
 
-    function toString(value) {
+    var lastStatesCleanup = 0;
+
+    var STATE_LIFETIME = 30 * 60 * 1000;
+    var CLEANUP_INTERVAL = 5 * 60 * 1000;
+    var FIRST_PAGE_RESET_DELAY = 3000;
+
+    function createLookup(values) {
+        var lookup = Object.create(null);
+
+        for (var i = 0; i < values.length; i++) {
+            lookup[values[i]] = true;
+        }
+
+        return lookup;
+    }
+
+    function toText(value) {
         return value == null ? '' : String(value);
     }
 
@@ -67,29 +86,44 @@
         ) ? 'tv' : 'movie';
     }
 
-    function isRestrictedContent(item) {
+    function getRestrictedContentMap() {
+        var settings = window.lampa_settings;
+
+        return settings &&
+            settings.lgbt &&
+            typeof settings.lgbt === 'object'
+                ? settings.lgbt
+                : null;
+    }
+
+    function isRestrictedContent(item, restrictedMap) {
         if (
-            !item ||
+            !restrictedMap ||
             item.id == null
         ) {
             return false;
         }
 
-        var settings =
-            window.lampa_settings &&
-            window.lampa_settings.lgbt;
+        var key =
+            item.id +
+            '_' +
+            getMediaType(item);
 
-        if (
-            !settings ||
-            typeof settings !== 'object'
-        ) {
+        return Boolean(restrictedMap[key]);
+    }
+
+    function hasBlockedLanguage(item) {
+        var language = item.original_language;
+
+        if (!language) {
             return false;
         }
 
-        var key =
-            item.id + '_' + getMediaType(item);
-
-        return Boolean(settings[key]);
+        return Boolean(
+            BLOCKED_LANGUAGES[
+                toText(language).toLowerCase()
+            ]
+        );
     }
 
     function hasBlockedCountry(item) {
@@ -99,8 +133,8 @@
         if (Array.isArray(countries)) {
             for (i = 0; i < countries.length; i++) {
                 if (
-                    BLOCK_COUNTRIES[
-                        toString(countries[i]).toUpperCase()
+                    BLOCKED_COUNTRIES[
+                        toText(countries[i]).toUpperCase()
                     ]
                 ) {
                     return true;
@@ -110,26 +144,58 @@
 
         countries = item.production_countries;
 
-        if (Array.isArray(countries)) {
-            for (i = 0; i < countries.length; i++) {
-                var country = countries[i] || {};
+        if (!Array.isArray(countries)) {
+            return false;
+        }
 
-                var code = toString(
-                    country.iso_3166_1 ||
-                    country.code ||
-                    country.name
-                ).toUpperCase();
+        for (i = 0; i < countries.length; i++) {
+            var country = countries[i] || {};
 
-                if (BLOCK_COUNTRIES[code]) {
-                    return true;
-                }
+            var code =
+                country.iso_3166_1 ||
+                country.code ||
+                country.name;
+
+            if (
+                BLOCKED_COUNTRIES[
+                    toText(code).toUpperCase()
+                ]
+            ) {
+                return true;
             }
         }
 
         return false;
     }
 
-    function shouldBlock(item) {
+    function hasBlockedOriginalScript(item) {
+        var originalTitle =
+            item.original_title ||
+            item.original_name;
+
+        return originalTitle
+            ? BLOCKED_SCRIPT_PATTERN.test(originalTitle)
+            : false;
+    }
+
+    function hasAnimeKeywords(item, localizedTitle) {
+        var originalTitle =
+            item.original_title ||
+            item.original_name ||
+            '';
+
+        var overview = item.overview || '';
+
+        return ANIME_PATTERN.test(
+            localizedTitle +
+            ' ' +
+            originalTitle +
+            ' ' +
+            overview
+        );
+    }
+
+    function shouldBlock(item, restrictedMap) {
         if (
             !item ||
             typeof item !== 'object'
@@ -140,25 +206,34 @@
         /*
          * Встроенный список ограниченного контента ByLampa.
          */
-        if (isRestrictedContent(item)) {
+        if (
+            isRestrictedContent(
+                item,
+                restrictedMap
+            )
+        ) {
             return true;
         }
 
         /*
-         * Оставляем только локализованные названия
-         * с кириллицей.
+         * Оставляем только карточки с названием на кириллице.
          */
-        var title = item.title || item.name || '';
+        var localizedTitle =
+            item.title ||
+            item.name ||
+            '';
 
-        if (!CYRILLIC_RE.test(title)) {
+        if (
+            !localizedTitle ||
+            !CYRILLIC_PATTERN.test(localizedTitle)
+        ) {
             return true;
         }
 
-        var language = toString(
-            item.original_language
-        ).toLowerCase();
-
-        if (BLOCK_LANGUAGES[language]) {
+        /*
+         * Быстрые проверки выполняются раньше текстовых.
+         */
+        if (hasBlockedLanguage(item)) {
             return true;
         }
 
@@ -166,23 +241,16 @@
             return true;
         }
 
-        var originalTitle =
-            item.original_title ||
-            item.original_name ||
-            '';
-
-        if (BLOCKED_SCRIPT_RE.test(originalTitle)) {
+        if (hasBlockedOriginalScript(item)) {
             return true;
         }
 
         /*
-         * Проверку описания выполняем последней,
-         * так как она самая затратная.
+         * Самая затратная проверка выполняется последней.
          */
-        return ANIME_RE.test(
-            title + ' ' +
-            originalTitle + ' ' +
-            toString(item.overview)
+        return hasAnimeKeywords(
+            item,
+            localizedTitle
         );
     }
 
@@ -200,42 +268,53 @@
             return type + ':' + item.id;
         }
 
-        return [
-            type,
-            toString(
-                item.original_title ||
-                item.original_name ||
-                item.title ||
-                item.name
-            ).toLowerCase(),
-            toString(
-                item.release_date ||
-                item.first_air_date
-            )
-        ].join(':');
+        var title =
+            item.original_title ||
+            item.original_name ||
+            item.title ||
+            item.name ||
+            '';
+
+        var date =
+            item.release_date ||
+            item.first_air_date ||
+            '';
+
+        return (
+            type +
+            ':' +
+            toText(title).toLowerCase() +
+            ':' +
+            toText(date)
+        );
     }
 
     /*
-     * Фильтрация одного горизонтального блока.
-     * Дубли удаляются только внутри этого блока.
+     * Общая функция фильтрации.
+     *
+     * seen:
+     * - для горизонтального блока создаётся новый объект;
+     * - для полного каталога хранится между страницами.
      */
-    function filterRowResults(data) {
-        if (
-            !data ||
-            typeof data !== 'object' ||
-            !Array.isArray(data.results)
-        ) {
-            return data;
+    function filterItems(items, seen) {
+        if (!Array.isArray(items)) {
+            return items;
         }
 
-        var source = data.results;
+        var restrictedMap =
+            getRestrictedContentMap();
+
         var result = [];
-        var seen = Object.create(null);
 
-        for (var i = 0; i < source.length; i++) {
-            var item = source[i];
+        for (var i = 0; i < items.length; i++) {
+            var item = items[i];
 
-            if (shouldBlock(item)) {
+            if (
+                shouldBlock(
+                    item,
+                    restrictedMap
+                )
+            ) {
                 continue;
             }
 
@@ -252,32 +331,52 @@
             result.push(item);
         }
 
-        data.results = result;
+        return result;
+    }
+
+    /*
+     * Фильтрация горизонтального блока.
+     * Дубли отслеживаются только внутри текущего блока.
+     */
+    function filterRowResponse(data) {
+        if (
+            !data ||
+            typeof data !== 'object' ||
+            !Array.isArray(data.results)
+        ) {
+            return data;
+        }
+
+        data.results = filterItems(
+            data.results,
+            Object.create(null)
+        );
 
         return data;
     }
 
     function getPage(params) {
-        if (
-            params &&
-            Number(params.page) > 0
-        ) {
-            return Number(params.page);
+        if (!params) {
+            return 1;
         }
 
-        var url = toString(
-            params && params.url
-        );
+        var page = Number(params.page);
 
-        var match = url.match(
+        if (page > 0) {
+            return page;
+        }
+
+        var match = toText(params.url).match(
             /[?&]page=(\d+)/i
         );
 
-        return match ? Number(match[1]) : 1;
+        return match
+            ? Number(match[1])
+            : 1;
     }
 
-    function removePageFromUrl(url) {
-        return toString(url)
+    function removePageParameter(url) {
+        return toText(url)
             .replace(
                 /([?&])page=\d+(&?)/i,
                 function (_, prefix, suffix) {
@@ -288,7 +387,9 @@
                         return '?';
                     }
 
-                    return suffix ? prefix : '';
+                    return suffix
+                        ? prefix
+                        : '';
                 }
             )
             .replace(/[?&]$/, '');
@@ -298,12 +399,12 @@
         params = params || {};
 
         return [
-            removePageFromUrl(params.url),
-            toString(params.genres),
-            toString(params.keywords),
-            toString(params.sort_by),
-            toString(params.year),
-            toString(params.query)
+            removePageParameter(params.url),
+            toText(params.genres),
+            toText(params.keywords),
+            toText(params.sort_by),
+            toText(params.year),
+            toText(params.query)
         ].join('|');
     }
 
@@ -314,19 +415,24 @@
         var state = catalogStates[key];
 
         if (!state) {
-            state = catalogStates[key] = {
+            state = {
                 seen: Object.create(null),
                 firstPageTime: 0,
                 touched: now
             };
+
+            catalogStates[key] = state;
         }
 
         /*
-         * Новое открытие первой страницы каталога.
+         * Сбрасываем список дублей при новом открытии каталога.
+         * Повторные запросы первой страницы в течение трёх секунд
+         * считаются частью одного открытия.
          */
         if (
             page === 1 &&
-            now - state.firstPageTime > 3000
+            now - state.firstPageTime >
+                FIRST_PAGE_RESET_DELAY
         ) {
             state.seen = Object.create(null);
             state.firstPageTime = now;
@@ -337,14 +443,38 @@
         return state;
     }
 
+    function cleanupCatalogStates() {
+        var now = Date.now();
+
+        if (
+            now - lastStatesCleanup <
+            CLEANUP_INTERVAL
+        ) {
+            return;
+        }
+
+        lastStatesCleanup = now;
+
+        var keys = Object.keys(catalogStates);
+
+        for (var i = 0; i < keys.length; i++) {
+            var key = keys[i];
+            var state = catalogStates[key];
+
+            if (
+                now - state.touched >
+                STATE_LIFETIME
+            ) {
+                delete catalogStates[key];
+            }
+        }
+    }
+
     /*
-     * Фильтрация большого каталога.
-     * Дубли удаляются между всеми его страницами.
+     * Фильтрация полного каталога.
+     * Один список seen используется для всех страниц каталога.
      */
-    function filterCatalogResults(
-        data,
-        params
-    ) {
+    function filterCatalogResponse(data, params) {
         if (
             !data ||
             typeof data !== 'object' ||
@@ -353,82 +483,50 @@
             return data;
         }
 
-        var source = data.results;
-        var result = [];
+        cleanupCatalogStates();
+
         var state = getCatalogState(params);
 
-        for (var i = 0; i < source.length; i++) {
-            var item = source[i];
-
-            if (shouldBlock(item)) {
-                continue;
-            }
-
-            var key = getItemKey(item);
-
-            if (
-                key &&
-                state.seen[key]
-            ) {
-                continue;
-            }
-
-            if (key) {
-                state.seen[key] = true;
-            }
-
-            result.push(item);
-        }
-
-        data.results = result;
+        data.results = filterItems(
+            data.results,
+            state.seen
+        );
 
         return data;
     }
 
-    function cleanupCatalogStates() {
-        var now = Date.now();
-        var keys = Object.keys(catalogStates);
+    function patchList(tmdbSource) {
+        var originalList = tmdbSource.list;
 
-        for (var i = 0; i < keys.length; i++) {
-            var key = keys[i];
-
-            if (
-                now -
-                catalogStates[key].touched >
-                30 * 60 * 1000
-            ) {
-                delete catalogStates[key];
-            }
-        }
-    }
-
-    function patchList(source) {
         if (
-            !source ||
-            typeof source.list !== 'function' ||
-            source.list.__noAnimePatched
+            typeof originalList !== 'function' ||
+            originalList.__noAnimePatched
         ) {
             return;
         }
 
-        var originalList = source.list;
-
-        source.list = function (
+        function patchedList(
             params,
             oncomplete,
             onerror
         ) {
             var callback = oncomplete;
 
-            if (typeof callback === 'function') {
-                callback = function (data) {
-                    cleanupCatalogStates();
+            if (typeof oncomplete === 'function') {
+                callback = function () {
+                    var args =
+                        Array.prototype.slice.call(
+                            arguments
+                        );
 
-                    oncomplete(
-                        filterCatalogResults(
-                            data,
-                            params
-                        )
+                    args[0] = filterCatalogResponse(
+                        args[0],
+                        params
+                    );
+
+                    return oncomplete.apply(
+                        this,
+                        args
                     );
                 };
             }
@@ -439,20 +537,21 @@
                 callback,
                 onerror
             );
-        };
+        }
 
-        source.list.__noAnimePatched = true;
+        patchedList.__noAnimePatched = true;
+        tmdbSource.list = patchedList;
     }
 
     function wrapPart(part) {
         if (
             typeof part !== 'function' ||
-            part.__noAnimePartWrapped
+            part.__noAnimeWrapped
         ) {
             return part;
         }
 
-        var wrapped = function () {
+        function wrappedPart() {
             var args =
                 Array.prototype.slice.call(
                     arguments
@@ -461,40 +560,47 @@
             var callback = args[0];
 
             if (typeof callback === 'function') {
-                args[0] = function (data) {
-                    return callback(
-                        filterRowResults(data)
+                args[0] = function () {
+                    var callbackArgs =
+                        Array.prototype.slice.call(
+                            arguments
+                        );
+
+                    callbackArgs[0] =
+                        filterRowResponse(
+                            callbackArgs[0]
+                        );
+
+                    return callback.apply(
+                        this,
+                        callbackArgs
                     );
                 };
             }
 
             return part.apply(this, args);
-        };
+        }
 
-        wrapped.__noAnimePartWrapped = true;
+        wrappedPart.__noAnimeWrapped = true;
 
-        return wrapped;
+        return wrappedPart;
     }
 
     /*
-     * Api.partNext загружает вертикально расположенные
-     * горизонтальные блоки main/category.
-     *
-     * Мы фильтруем данные каждой части до создания карточек,
-     * не вмешиваясь в main() и category().
+     * Вертикальные страницы состоят из горизонтальных блоков,
+     * которые загружаются через Api.partNext().
      */
     function patchPartNext(api) {
+        var originalPartNext = api.partNext;
+
         if (
-            !api ||
-            typeof api.partNext !== 'function' ||
-            api.partNext.__noAnimePatched
+            typeof originalPartNext !== 'function' ||
+            originalPartNext.__noAnimePatched
         ) {
             return;
         }
 
-        var originalPartNext = api.partNext;
-
-        api.partNext = function (
+        function patchedPartNext(
             parts,
             limit,
             partLoaded,
@@ -517,12 +623,13 @@
                 partLoaded,
                 partEmpty
             );
-        };
+        }
 
-        api.partNext.__noAnimePatched = true;
+        patchedPartNext.__noAnimePatched = true;
+        api.partNext = patchedPartNext;
     }
 
-    function init() {
+    function initialize() {
         var lampa = window.Lampa;
 
         if (
@@ -531,7 +638,7 @@
             !lampa.Api.sources ||
             !lampa.Api.sources.tmdb
         ) {
-            setTimeout(init, 200);
+            setTimeout(initialize, 200);
             return;
         }
 
@@ -544,5 +651,5 @@
         );
     }
 
-    init();
+    initialize();
 })();
