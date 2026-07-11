@@ -1,4 +1,4 @@
-/* No Anime TMDB — Version 2.2.2 */
+/* No Anime TMDB — Version 2.2.4 */
 
 (function () {
     'use strict';
@@ -41,8 +41,45 @@
     var ANIME_RE =
         /(?:^|[^a-zа-яё])(?:anime|аниме|manga|манга|shonen|shounen|seinen|isekai|otaku|anilibria|crunchyroll)(?:$|[^a-zа-яё])/i;
 
+    /*
+     * Для каждого каталога храним уже показанные карточки,
+     * чтобы удалять повторы между страницами.
+     */
+    var catalogStates = Object.create(null);
+
     function string(value) {
         return String(value || '');
+    }
+
+    function isRestrictedContent(item) {
+        if (
+            !item ||
+            item.id === undefined ||
+            item.id === null
+        ) {
+            return false;
+        }
+
+        var restricted =
+            window.lampa_settings &&
+            window.lampa_settings.lgbt;
+
+        if (!restricted || typeof restricted !== 'object') {
+            return false;
+        }
+
+        var type =
+            item.media_type ||
+            (
+                item.first_air_date ||
+                item.original_name
+                    ? 'tv'
+                    : 'movie'
+            );
+
+        var key = item.id + '_' + type;
+
+        return Boolean(restricted[key]);
     }
 
     function hasBlockedCountry(item) {
@@ -50,7 +87,8 @@
 
         if (Array.isArray(countries)) {
             for (var i = 0; i < countries.length; i++) {
-                var originCode = string(countries[i]).toUpperCase();
+                var originCode =
+                    string(countries[i]).toUpperCase();
 
                 if (BLOCK_COUNTRIES[originCode]) {
                     return true;
@@ -84,13 +122,21 @@
             return false;
         }
 
+        /*
+         * Удаляем контент, который ByLampa сама
+         * помечает встроенным списком ограничений.
+         */
+        if (isRestrictedContent(item)) {
+            return true;
+        }
+
         var localizedTitle = string(
             item.title || item.name
         );
 
         /*
-         * Оставляем только карточки,
-         * локализованное название которых содержит кириллицу.
+         * Оставляем только карточки с названием
+         * на кириллице.
          */
         if (!CYRILLIC_RE.test(localizedTitle)) {
             return true;
@@ -109,8 +155,12 @@
         }
 
         if (
-            BLOCKED_SCRIPT_RE.test(string(item.original_title)) ||
-            BLOCKED_SCRIPT_RE.test(string(item.original_name))
+            BLOCKED_SCRIPT_RE.test(
+                string(item.original_title)
+            ) ||
+            BLOCKED_SCRIPT_RE.test(
+                string(item.original_name)
+            )
         ) {
             return true;
         }
@@ -126,7 +176,119 @@
         return ANIME_RE.test(searchableText);
     }
 
-    function filterResponse(data) {
+    function getItemKey(item) {
+        if (!item || typeof item !== 'object') {
+            return '';
+        }
+
+        var mediaType =
+            item.media_type ||
+            (
+                item.original_name ||
+                item.first_air_date
+                    ? 'tv'
+                    : 'movie'
+            );
+
+        if (
+            item.id !== undefined &&
+            item.id !== null
+        ) {
+            return mediaType + ':' + item.id;
+        }
+
+        return [
+            mediaType,
+            string(
+                item.original_title ||
+                item.original_name ||
+                item.title ||
+                item.name
+            ).toLowerCase(),
+            string(
+                item.release_date ||
+                item.first_air_date
+            )
+        ].join(':');
+    }
+
+    function getPage(params) {
+        if (!params || typeof params !== 'object') {
+            return 1;
+        }
+
+        var directPage = Number(params.page);
+
+        if (directPage > 0) {
+            return directPage;
+        }
+
+        var url = string(params.url);
+        var match = url.match(/[?&]page=(\d+)/i);
+
+        return match ? Number(match[1]) : 1;
+    }
+
+    function getCatalogKey(params) {
+        if (!params || typeof params !== 'object') {
+            return 'default';
+        }
+
+        var url = string(params.url)
+            .replace(
+                /([?&])page=\d+(&?)/i,
+                function (_, prefix, suffix) {
+                    if (prefix === '?' && suffix) {
+                        return '?';
+                    }
+
+                    return suffix ? prefix : '';
+                }
+            )
+            .replace(/[?&]$/, '');
+
+        return [
+            url,
+            string(params.genres),
+            string(params.keywords),
+            string(params.sort_by),
+            string(params.year),
+            string(params.query)
+        ].join('|');
+    }
+
+    function getCatalogState(params) {
+        var key = getCatalogKey(params);
+        var page = getPage(params);
+        var now = Date.now();
+        var state = catalogStates[key];
+
+        if (!state) {
+            state = catalogStates[key] = {
+                seen: Object.create(null),
+                lastFirstPage: 0,
+                touched: now
+            };
+        }
+
+        /*
+         * При новом открытии каталога сбрасываем
+         * список ранее показанных карточек.
+         */
+        if (
+            page === 1 &&
+            now - state.lastFirstPage > 3000
+        ) {
+            state.seen = Object.create(null);
+            state.lastFirstPage = now;
+        }
+
+        state.touched = now;
+
+        return state;
+    }
+
+    function filterResponse(data, params) {
         if (
             !data ||
             typeof data !== 'object' ||
@@ -135,11 +297,48 @@
             return data;
         }
 
-        data.results = data.results.filter(function (item) {
-            return !shouldBlock(item);
-        });
+        var state = getCatalogState(params);
+        var filtered = [];
+
+        for (var i = 0; i < data.results.length; i++) {
+            var item = data.results[i];
+
+            if (shouldBlock(item)) {
+                continue;
+            }
+
+            var key = getItemKey(item);
+
+            if (key && state.seen[key]) {
+                continue;
+            }
+
+            if (key) {
+                state.seen[key] = true;
+            }
+
+            filtered.push(item);
+        }
+
+        data.results = filtered;
 
         return data;
+    }
+
+    function cleanupOldStates() {
+        var now = Date.now();
+        var keys = Object.keys(catalogStates);
+
+        for (var i = 0; i < keys.length; i++) {
+            var key = keys[i];
+
+            if (
+                now - catalogStates[key].touched >
+                30 * 60 * 1000
+            ) {
+                delete catalogStates[key];
+            }
+        }
     }
 
     function patchList(source) {
@@ -153,11 +352,19 @@
 
         var originalList = source.list;
 
-        source.list = function (params, oncomplete, onerror) {
+        source.list = function (
+            params,
+            oncomplete,
+            onerror
+        ) {
             var filteredComplete =
                 typeof oncomplete === 'function'
                     ? function (data) {
-                        oncomplete(filterResponse(data));
+                        cleanupOldStates();
+
+                        oncomplete(
+                            filterResponse(data, params)
+                        );
                     }
                     : oncomplete;
 
@@ -185,9 +392,8 @@
         }
 
         /*
-         * ВАЖНО:
-         * main() и category() намеренно не изменяются.
-         * Их перехват вызывал повторную отрисовку секций и дубли.
+         * Фильтруем только большую сетку каталога.
+         * DOM, main() и category() не изменяем.
          */
         patchList(source);
     }
