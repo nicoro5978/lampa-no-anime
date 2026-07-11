@@ -1,11 +1,18 @@
-/* No Anime TMDB — Version 2.2.0 */
+/* No Anime TMDB — Version 2.2.2 */
 
 (function () {
     'use strict';
 
+    if (window.__NO_ANIME_TMDB_ACTIVE__) {
+        return;
+    }
+
+    window.__NO_ANIME_TMDB_ACTIVE__ = true;
+
     var BLOCK_LANGUAGES = {
         ja: true,
         ko: true,
+
         hi: true,
         te: true,
         ta: true,
@@ -15,6 +22,7 @@
         mr: true,
         pa: true,
         ur: true,
+
         th: true
     };
 
@@ -33,16 +41,16 @@
     var ANIME_RE =
         /(?:^|[^a-zа-яё])(?:anime|аниме|manga|манга|shonen|shounen|seinen|isekai|otaku|anilibria|crunchyroll)(?:$|[^a-zа-яё])/i;
 
-    function text(value) {
+    function string(value) {
         return String(value || '');
     }
 
-    function hasBlockedCountry(data) {
-        var countries = data.origin_country;
+    function hasBlockedCountry(item) {
+        var countries = item.origin_country;
 
         if (Array.isArray(countries)) {
             for (var i = 0; i < countries.length; i++) {
-                var originCode = text(countries[i]).toUpperCase();
+                var originCode = string(countries[i]).toUpperCase();
 
                 if (BLOCK_COUNTRIES[originCode]) {
                     return true;
@@ -50,13 +58,13 @@
             }
         }
 
-        countries = data.production_countries;
+        countries = item.production_countries;
 
         if (Array.isArray(countries)) {
             for (var j = 0; j < countries.length; j++) {
                 var country = countries[j] || {};
 
-                var productionCode = text(
+                var productionCode = string(
                     country.iso_3166_1 ||
                     country.code ||
                     country.name
@@ -71,163 +79,97 @@
         return false;
     }
 
-    function shouldBlock(data) {
-        if (!data || typeof data !== 'object') {
+    function shouldBlock(item) {
+        if (!item || typeof item !== 'object') {
             return false;
         }
 
-        var title = text(data.title || data.name);
+        var localizedTitle = string(
+            item.title || item.name
+        );
 
         /*
          * Оставляем только карточки,
-         * название которых содержит кириллицу.
+         * локализованное название которых содержит кириллицу.
          */
-        if (!CYRILLIC_RE.test(title)) {
+        if (!CYRILLIC_RE.test(localizedTitle)) {
             return true;
         }
 
-        var language = text(
-            data.original_language
+        var language = string(
+            item.original_language
         ).toLowerCase();
 
         if (BLOCK_LANGUAGES[language]) {
             return true;
         }
 
-        if (hasBlockedCountry(data)) {
+        if (hasBlockedCountry(item)) {
             return true;
         }
 
         if (
-            BLOCKED_SCRIPT_RE.test(text(data.original_title)) ||
-            BLOCKED_SCRIPT_RE.test(text(data.original_name))
+            BLOCKED_SCRIPT_RE.test(string(item.original_title)) ||
+            BLOCKED_SCRIPT_RE.test(string(item.original_name))
         ) {
             return true;
         }
 
-        var combinedText = [
-            data.title,
-            data.name,
-            data.original_title,
-            data.original_name,
-            data.overview
+        var searchableText = [
+            item.title,
+            item.name,
+            item.original_title,
+            item.original_name,
+            item.overview
         ].filter(Boolean).join(' ');
 
-        return ANIME_RE.test(combinedText);
+        return ANIME_RE.test(searchableText);
     }
 
-    function filterResults(data) {
-        if (!data || typeof data !== 'object') {
+    function filterResponse(data) {
+        if (
+            !data ||
+            typeof data !== 'object' ||
+            !Array.isArray(data.results)
+        ) {
             return data;
         }
 
-        if (Array.isArray(data)) {
-            return data.filter(function (item) {
-                return !shouldBlock(item);
-            });
-        }
-
-        if (Array.isArray(data.results)) {
-            data.results = data.results.filter(function (item) {
-                return !shouldBlock(item);
-            });
-        }
+        data.results = data.results.filter(function (item) {
+            return !shouldBlock(item);
+        });
 
         return data;
     }
 
-    function wrapComplete(callback) {
-        if (typeof callback !== 'function') {
-            return callback;
+    function patchList(source) {
+        if (
+            !source ||
+            typeof source.list !== 'function' ||
+            source.list.__noAnimeTmdbPatched
+        ) {
+            return;
         }
 
-        return function (data) {
-            return callback.call(
+        var originalList = source.list;
+
+        source.list = function (params, oncomplete, onerror) {
+            var filteredComplete =
+                typeof oncomplete === 'function'
+                    ? function (data) {
+                        oncomplete(filterResponse(data));
+                    }
+                    : oncomplete;
+
+            return originalList.call(
                 this,
-                filterResults(data)
+                params,
+                filteredComplete,
+                onerror
             );
         };
-    }
 
-    function patchMethod(source, methodName) {
-        var original = source[methodName];
-
-        if (
-            typeof original !== 'function' ||
-            original.__noAnimeTmdbPatched
-        ) {
-            return;
-        }
-
-        var patched = function () {
-            var args = Array.prototype.slice.call(arguments);
-
-            /*
-             * У main, category и list второй аргумент —
-             * callback успешного завершения.
-             */
-            if (typeof args[1] === 'function') {
-                args[1] = wrapComplete(args[1]);
-            }
-
-            return original.apply(this, args);
-        };
-
-        patched.__noAnimeTmdbPatched = true;
-        source[methodName] = patched;
-    }
-
-    /*
-     * ByLampa добавляет .card__filter уже после получения
-     * данных. Оставляем только лёгкое наблюдение за этим
-     * конкретным элементом, без пересканирования каталога.
-     */
-    function removeFilteredCard(node) {
-        if (!node || node.nodeType !== 1) {
-            return;
-        }
-
-        if (
-            node.classList &&
-            node.classList.contains('card__filter')
-        ) {
-            var card = node.closest('.card');
-
-            if (card) {
-                card.remove();
-            }
-
-            return;
-        }
-
-        if (!node.querySelectorAll) {
-            return;
-        }
-
-        var filters = node.querySelectorAll('.card__filter');
-
-        for (var i = 0; i < filters.length; i++) {
-            var ownerCard = filters[i].closest('.card');
-
-            if (ownerCard) {
-                ownerCard.remove();
-            }
-        }
-    }
-
-    function startFilterObserver() {
-        new MutationObserver(function (mutations) {
-            for (var i = 0; i < mutations.length; i++) {
-                var nodes = mutations[i].addedNodes;
-
-                for (var j = 0; j < nodes.length; j++) {
-                    removeFilteredCard(nodes[j]);
-                }
-            }
-        }).observe(document.body, {
-            childList: true,
-            subtree: true
-        });
+        source.list.__noAnimeTmdbPatched = true;
     }
 
     function init() {
@@ -242,19 +184,12 @@
             return;
         }
 
-        patchMethod(source, 'list');
-        patchMethod(source, 'category');
-        patchMethod(source, 'main');
-
-        if (document.body) {
-            startFilterObserver();
-        } else {
-            document.addEventListener(
-                'DOMContentLoaded',
-                startFilterObserver,
-                { once: true }
-            );
-        }
+        /*
+         * ВАЖНО:
+         * main() и category() намеренно не изменяются.
+         * Их перехват вызывал повторную отрисовку секций и дубли.
+         */
+        patchList(source);
     }
 
     init();
