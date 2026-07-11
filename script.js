@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    var BLOCK_LANGUAGES = Object.freeze({
+    var BLOCK_LANGUAGES = {
         ja: true,
         ko: true,
         hi: true,
@@ -14,14 +14,14 @@
         pa: true,
         ur: true,
         th: true
-    });
+    };
 
-    var BLOCK_COUNTRIES = Object.freeze({
+    var BLOCK_COUNTRIES = {
         JP: true,
         KR: true,
         IN: true,
         TH: true
-    });
+    };
 
     var CYRILLIC_RE = /[А-ЯЁа-яё]/;
 
@@ -32,60 +32,48 @@
         /(?:^|[^a-zа-яё])(?:anime|аниме|manga|манга|shonen|shounen|seinen|isekai|otaku|anilibria|crunchyroll)(?:$|[^a-zа-яё])/i;
 
     var pendingCards = [];
-    var pendingSet = typeof WeakSet !== 'undefined' ? new WeakSet() : null;
+    var pendingSet = new WeakSet();
     var frameRequested = false;
 
-    function normalize(value) {
-        return String(value || '').trim();
+    function string(value) {
+        return String(value || '');
     }
 
     function hasCyrillicTitle(data) {
-        if (!data || typeof data !== 'object') {
-            return false;
-        }
-
-        return CYRILLIC_RE.test(normalize(data.title || data.name));
+        return CYRILLIC_RE.test(string(data.title || data.name));
     }
 
     function hasBlockedLanguage(data) {
-        var language = normalize(data.original_language).toLowerCase();
-
-        return Boolean(BLOCK_LANGUAGES[language]);
+        return Boolean(
+            BLOCK_LANGUAGES[string(data.original_language).toLowerCase()]
+        );
     }
 
-    function hasBlockedOriginCountry(data) {
+    function hasBlockedCountry(data) {
         var countries = data.origin_country;
 
-        if (!Array.isArray(countries)) {
-            return false;
-        }
-
-        for (var i = 0; i < countries.length; i++) {
-            var code = normalize(countries[i]).toUpperCase();
-
-            if (BLOCK_COUNTRIES[code]) {
-                return true;
+        if (Array.isArray(countries)) {
+            for (var i = 0; i < countries.length; i++) {
+                if (BLOCK_COUNTRIES[string(countries[i]).toUpperCase()]) {
+                    return true;
+                }
             }
         }
 
-        return false;
-    }
+        countries = data.production_countries;
 
-    function hasBlockedProductionCountry(data) {
-        var countries = data.production_countries;
+        if (Array.isArray(countries)) {
+            for (var j = 0; j < countries.length; j++) {
+                var country = countries[j] || {};
+                var code = string(
+                    country.iso_3166_1 ||
+                    country.code ||
+                    country.name
+                ).toUpperCase();
 
-        if (!Array.isArray(countries)) {
-            return false;
-        }
-
-        for (var i = 0; i < countries.length; i++) {
-            var country = countries[i] || {};
-            var code = normalize(
-                country.iso_3166_1 || country.code || country.name
-            ).toUpperCase();
-
-            if (BLOCK_COUNTRIES[code]) {
-                return true;
+                if (BLOCK_COUNTRIES[code]) {
+                    return true;
+                }
             }
         }
 
@@ -94,24 +82,22 @@
 
     function hasBlockedOriginalScript(data) {
         return (
-            BLOCKED_SCRIPT_RE.test(normalize(data.original_title)) ||
-            BLOCKED_SCRIPT_RE.test(normalize(data.original_name))
+            BLOCKED_SCRIPT_RE.test(string(data.original_title)) ||
+            BLOCKED_SCRIPT_RE.test(string(data.original_name))
         );
     }
 
-    function hasAnimeKeywords(data) {
-        var text = [
+    function hasAnimeWords(data) {
+        return ANIME_WORDS_RE.test([
             data.title,
             data.name,
             data.original_title,
             data.original_name,
             data.overview
-        ].filter(Boolean).join(' ');
-
-        return ANIME_WORDS_RE.test(text);
+        ].filter(Boolean).join(' '));
     }
 
-    function isBlockedByData(data) {
+    function isBlocked(data) {
         if (!data || typeof data !== 'object') {
             return false;
         }
@@ -122,18 +108,13 @@
 
         return (
             hasBlockedLanguage(data) ||
-            hasBlockedOriginCountry(data) ||
-            hasBlockedProductionCountry(data) ||
+            hasBlockedCountry(data) ||
             hasBlockedOriginalScript(data) ||
-            hasAnimeKeywords(data)
+            hasAnimeWords(data)
         );
     }
 
     function removeCard(card) {
-        if (!card || card.__contentFilterRemoved) {
-            return;
-        }
-
         card.__contentFilterRemoved = true;
 
         if (card.parentNode) {
@@ -150,10 +131,6 @@
             return;
         }
 
-        /*
-         * .card__filter может быть добавлен после появления карточки,
-         * поэтому эту проверку нельзя навсегда помечать как выполненную.
-         */
         if (
             card.querySelector &&
             card.querySelector('.card__filter')
@@ -164,20 +141,30 @@
 
         var data = card.card_data;
 
+        /*
+         * card_data иногда добавляется уже после появления карточки.
+         * В таком случае проверим её ещё раз немного позже.
+         */
         if (!data || typeof data !== 'object') {
+            if (!card.__contentFilterRetryScheduled) {
+                card.__contentFilterRetryScheduled = true;
+
+                setTimeout(function () {
+                    card.__contentFilterRetryScheduled = false;
+                    queueCard(card);
+                }, 100);
+            }
+
             return;
         }
 
-        /*
-         * Данные карточки обычно неизменны, поэтому проверяем их один раз.
-         */
         if (card.__contentFilterDataChecked) {
             return;
         }
 
         card.__contentFilterDataChecked = true;
 
-        if (isBlockedByData(data)) {
+        if (isBlocked(data)) {
             removeCard(card);
         }
     }
@@ -187,10 +174,7 @@
 
         var cards = pendingCards;
         pendingCards = [];
-
-        if (pendingSet) {
-            pendingSet = new WeakSet();
-        }
+        pendingSet = new WeakSet();
 
         for (var i = 0; i < cards.length; i++) {
             processCard(cards[i]);
@@ -201,21 +185,13 @@
         if (
             !card ||
             card.nodeType !== 1 ||
-            card.__contentFilterRemoved
+            card.__contentFilterRemoved ||
+            pendingSet.has(card)
         ) {
             return;
         }
 
-        if (pendingSet) {
-            if (pendingSet.has(card)) {
-                return;
-            }
-
-            pendingSet.add(card);
-        } else if (pendingCards.indexOf(card) !== -1) {
-            return;
-        }
-
+        pendingSet.add(card);
         pendingCards.push(card);
 
         if (!frameRequested) {
@@ -229,80 +205,66 @@
         }
     }
 
-    function queueCardsInside(root) {
-        if (!root || root.nodeType !== 1) {
+    function scanNode(node) {
+        if (!node || node.nodeType !== 1) {
             return;
         }
 
-        if (root.classList && root.classList.contains('card')) {
-            queueCard(root);
+        var ownerCard = node.closest
+            ? node.closest('.card')
+            : null;
+
+        if (ownerCard) {
+            queueCard(ownerCard);
         }
 
-        /*
-         * Если внутри добавился .card__filter,
-         * повторно проверяем его родительскую карточку.
-         */
         if (
-            root.classList &&
-            root.classList.contains('card__filter')
+            node.classList &&
+            node.classList.contains('card')
         ) {
-            var ownerCard = root.closest
-                ? root.closest('.card')
-                : null;
-
-            if (ownerCard) {
-                queueCard(ownerCard);
-            }
+            queueCard(node);
         }
 
-        /*
-         * Элемент мог быть добавлен внутрь уже существующей карточки.
-         */
-        if (root.closest) {
-            var parentCard = root.closest('.card');
-
-            if (parentCard) {
-                queueCard(parentCard);
-            }
-        }
-
-        if (!root.querySelectorAll) {
+        if (!node.querySelectorAll) {
             return;
         }
 
-        var cards = root.querySelectorAll('.card');
+        var cards = node.querySelectorAll('.card');
 
         for (var i = 0; i < cards.length; i++) {
             queueCard(cards[i]);
         }
-
-        var filters = root.querySelectorAll('.card__filter');
-
-        for (var j = 0; j < filters.length; j++) {
-            var card = filters[j].closest
-                ? filters[j].closest('.card')
-                : null;
-
-            if (card) {
-                queueCard(card);
-            }
-        }
     }
 
     function start() {
-        queueCardsInside(document.body);
+        scanNode(document.body);
 
-        var observer = new MutationObserver(function (mutations) {
+        new MutationObserver(function (mutations) {
             for (var i = 0; i < mutations.length; i++) {
-                var addedNodes = mutations[i].addedNodes;
+                var mutation = mutations[i];
 
-                for (var j = 0; j < addedNodes.length; j++) {
-                    queueCardsInside(addedNodes[j]);
+                for (var j = 0; j < mutation.addedNodes.length; j++) {
+                    scanNode(mutation.addedNodes[j]);
+                }
+
+                /*
+                 * Повторно проверяем карточку, внутрь которой добавились
+                 * новые элементы, например .card__filter.
+                 */
+                if (
+                    mutation.target &&
+                    mutation.target.nodeType === 1
+                ) {
+                    var card = mutation.target.closest
+                        ? mutation.target.closest('.card')
+                        : null;
+
+                    if (card) {
+                        queueCard(card);
+                    }
                 }
             }
-        });
-
-        observer.observe(document.body, {
+        }).observe(document.body, {
             childList: true,
             subtree: true
         });
