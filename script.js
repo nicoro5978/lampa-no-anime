@@ -1,4 +1,4 @@
-/* No Anime TMDB — Version 2.1.1 */
+/* No Anime TMDB — Version 2.2.0 */
 
 (function () {
     'use strict';
@@ -33,10 +33,6 @@
     var ANIME_RE =
         /(?:^|[^a-zа-яё])(?:anime|аниме|manga|манга|shonen|shounen|seinen|isekai|otaku|anilibria|crunchyroll)(?:$|[^a-zа-яё])/i;
 
-    var queued = [];
-    var queuedSet = new WeakSet();
-    var framePending = false;
-
     function text(value) {
         return String(value || '');
     }
@@ -46,7 +42,9 @@
 
         if (Array.isArray(countries)) {
             for (var i = 0; i < countries.length; i++) {
-                if (BLOCK_COUNTRIES[text(countries[i]).toUpperCase()]) {
+                var originCode = text(countries[i]).toUpperCase();
+
+                if (BLOCK_COUNTRIES[originCode]) {
                     return true;
                 }
             }
@@ -58,13 +56,13 @@
             for (var j = 0; j < countries.length; j++) {
                 var country = countries[j] || {};
 
-                var code = text(
+                var productionCode = text(
                     country.iso_3166_1 ||
                     country.code ||
                     country.name
                 ).toUpperCase();
 
-                if (BLOCK_COUNTRIES[code]) {
+                if (BLOCK_COUNTRIES[productionCode]) {
                     return true;
                 }
             }
@@ -80,11 +78,17 @@
 
         var title = text(data.title || data.name);
 
+        /*
+         * Оставляем только карточки,
+         * название которых содержит кириллицу.
+         */
         if (!CYRILLIC_RE.test(title)) {
             return true;
         }
 
-        var language = text(data.original_language).toLowerCase();
+        var language = text(
+            data.original_language
+        ).toLowerCase();
 
         if (BLOCK_LANGUAGES[language]) {
             return true;
@@ -101,155 +105,123 @@
             return true;
         }
 
-        return ANIME_RE.test([
+        var combinedText = [
             data.title,
             data.name,
             data.original_title,
             data.original_name,
             data.overview
-        ].filter(Boolean).join(' '));
+        ].filter(Boolean).join(' ');
+
+        return ANIME_RE.test(combinedText);
     }
 
-    function removeCard(card) {
-        if (!card || card.__noAnimeRemoved) {
-            return;
+    function filterResults(data) {
+        if (!data || typeof data !== 'object') {
+            return data;
         }
 
-        card.__noAnimeRemoved = true;
-
-        if (card.parentNode) {
-            card.parentNode.removeChild(card);
+        if (Array.isArray(data)) {
+            return data.filter(function (item) {
+                return !shouldBlock(item);
+            });
         }
+
+        if (Array.isArray(data.results)) {
+            data.results = data.results.filter(function (item) {
+                return !shouldBlock(item);
+            });
+        }
+
+        return data;
     }
 
-    function processCard(card) {
+    function wrapComplete(callback) {
+        if (typeof callback !== 'function') {
+            return callback;
+        }
+
+        return function (data) {
+            return callback.call(
+                this,
+                filterResults(data)
+            );
+        };
+    }
+
+    function patchMethod(source, methodName) {
+        var original = source[methodName];
+
         if (
-            !card ||
-            card.nodeType !== 1 ||
-            card.__noAnimeRemoved
+            typeof original !== 'function' ||
+            original.__noAnimeTmdbPatched
         ) {
             return;
         }
 
-        /*
-         * Встроенный фильтр ByLampa добавляет этот элемент
-         * уже после создания карточки.
-         */
-        if (card.querySelector('.card__filter')) {
-            removeCard(card);
-            return;
-        }
+        var patched = function () {
+            var args = Array.prototype.slice.call(arguments);
 
-        var data = card.card_data;
-
-        if (!data || typeof data !== 'object') {
-            if (!card.__noAnimeRetry) {
-                card.__noAnimeRetry = true;
-
-                setTimeout(function () {
-                    card.__noAnimeRetry = false;
-                    queueCard(card);
-                }, 100);
+            /*
+             * У main, category и list второй аргумент —
+             * callback успешного завершения.
+             */
+            if (typeof args[1] === 'function') {
+                args[1] = wrapComplete(args[1]);
             }
 
-            return;
-        }
+            return original.apply(this, args);
+        };
 
-        if (shouldBlock(data)) {
-            removeCard(card);
-        }
+        patched.__noAnimeTmdbPatched = true;
+        source[methodName] = patched;
     }
 
-    function flushQueue() {
-        framePending = false;
-
-        var cards = queued;
-
-        queued = [];
-        queuedSet = new WeakSet();
-
-        for (var i = 0; i < cards.length; i++) {
-            processCard(cards[i]);
-        }
-    }
-
-    function queueCard(card) {
-        if (
-            !card ||
-            card.nodeType !== 1 ||
-            card.__noAnimeRemoved ||
-            queuedSet.has(card)
-        ) {
-            return;
-        }
-
-        queuedSet.add(card);
-        queued.push(card);
-
-        if (framePending) {
-            return;
-        }
-
-        framePending = true;
-
-        if (typeof requestAnimationFrame === 'function') {
-            requestAnimationFrame(flushQueue);
-        } else {
-            setTimeout(flushQueue, 0);
-        }
-    }
-
-    function scanNode(node) {
+    /*
+     * ByLampa добавляет .card__filter уже после получения
+     * данных. Оставляем только лёгкое наблюдение за этим
+     * конкретным элементом, без пересканирования каталога.
+     */
+    function removeFilteredCard(node) {
         if (!node || node.nodeType !== 1) {
             return;
         }
 
-        if (node.classList.contains('card')) {
-            queueCard(node);
-        }
+        if (
+            node.classList &&
+            node.classList.contains('card__filter')
+        ) {
+            var card = node.closest('.card');
 
-        if (node.classList.contains('card__filter')) {
-            var ownerCard = node.closest('.card');
-
-            if (ownerCard) {
-                queueCard(ownerCard);
+            if (card) {
+                card.remove();
             }
+
+            return;
         }
 
         if (!node.querySelectorAll) {
             return;
         }
 
-        var cards = node.querySelectorAll('.card');
-
-        for (var i = 0; i < cards.length; i++) {
-            queueCard(cards[i]);
-        }
-
         var filters = node.querySelectorAll('.card__filter');
 
-        for (var j = 0; j < filters.length; j++) {
-            var card = filters[j].closest('.card');
+        for (var i = 0; i < filters.length; i++) {
+            var ownerCard = filters[i].closest('.card');
 
-            if (card) {
-                queueCard(card);
+            if (ownerCard) {
+                ownerCard.remove();
             }
         }
     }
 
-    function start() {
-        var cards = document.querySelectorAll('.card');
-
-        for (var i = 0; i < cards.length; i++) {
-            queueCard(cards[i]);
-        }
-
+    function startFilterObserver() {
         new MutationObserver(function (mutations) {
             for (var i = 0; i < mutations.length; i++) {
                 var nodes = mutations[i].addedNodes;
 
                 for (var j = 0; j < nodes.length; j++) {
-                    scanNode(nodes[j]);
+                    removeFilteredCard(nodes[j]);
                 }
             }
         }).observe(document.body, {
@@ -258,11 +230,32 @@
         });
     }
 
-    if (document.body) {
-        start();
-    } else {
-        document.addEventListener('DOMContentLoaded', start, {
-            once: true
-        });
+    function init() {
+        var source =
+            window.Lampa &&
+            Lampa.Api &&
+            Lampa.Api.sources &&
+            Lampa.Api.sources.tmdb;
+
+        if (!source) {
+            setTimeout(init, 250);
+            return;
+        }
+
+        patchMethod(source, 'list');
+        patchMethod(source, 'category');
+        patchMethod(source, 'main');
+
+        if (document.body) {
+            startFilterObserver();
+        } else {
+            document.addEventListener(
+                'DOMContentLoaded',
+                startFilterObserver,
+                { once: true }
+            );
+        }
     }
+
+    init();
 })();
