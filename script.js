@@ -1,9 +1,12 @@
+/* No Anime TMDB — Version 2.1.0 */
+
 (function () {
     'use strict';
 
     var BLOCK_LANGUAGES = {
         ja: true,
         ko: true,
+
         hi: true,
         te: true,
         ta: true,
@@ -13,6 +16,7 @@
         mr: true,
         pa: true,
         ur: true,
+
         th: true
     };
 
@@ -31,13 +35,14 @@
     var ANIME_WORDS_RE =
         /(?:^|[^a-zа-яё])(?:anime|аниме|manga|манга|shonen|shounen|seinen|isekai|otaku|anilibria|crunchyroll)(?:$|[^a-zа-яё])/i;
 
-    var STYLE_ID = 'no-anime-tmdb-style';
     var HIDDEN_CLASS = 'no-anime-tmdb-hidden';
+    var STYLE_ID = 'no-anime-tmdb-style';
 
-    var pendingRows = new Set();
-    var frameRequested = false;
+    var pendingCards = [];
+    var pendingSet = new WeakSet();
+    var frameScheduled = false;
 
-    function text(value) {
+    function string(value) {
         return String(value || '');
     }
 
@@ -47,11 +52,21 @@
         }
 
         var style = document.createElement('style');
+
         style.id = STYLE_ID;
         style.textContent =
             '.' + HIDDEN_CLASS + '{' +
                 'display:none!important;' +
-                'visibility:hidden!important;' +
+                'width:0!important;' +
+                'min-width:0!important;' +
+                'max-width:0!important;' +
+                'height:0!important;' +
+                'min-height:0!important;' +
+                'max-height:0!important;' +
+                'margin:0!important;' +
+                'padding:0!important;' +
+                'border:0!important;' +
+                'overflow:hidden!important;' +
                 'pointer-events:none!important;' +
             '}';
 
@@ -60,12 +75,14 @@
 
     function hasCyrillicTitle(data) {
         return CYRILLIC_RE.test(
-            text(data.title || data.name)
+            string(data.title || data.name)
         );
     }
 
     function hasBlockedLanguage(data) {
-        var language = text(data.original_language).toLowerCase();
+        var language = string(
+            data.original_language
+        ).toLowerCase();
 
         return Boolean(BLOCK_LANGUAGES[language]);
     }
@@ -75,7 +92,9 @@
 
         if (Array.isArray(countries)) {
             for (var i = 0; i < countries.length; i++) {
-                var originCode = text(countries[i]).toUpperCase();
+                var originCode = string(
+                    countries[i]
+                ).toUpperCase();
 
                 if (BLOCK_COUNTRIES[originCode]) {
                     return true;
@@ -89,7 +108,7 @@
             for (var j = 0; j < countries.length; j++) {
                 var country = countries[j] || {};
 
-                var productionCode = text(
+                var productionCode = string(
                     country.iso_3166_1 ||
                     country.code ||
                     country.name
@@ -104,10 +123,14 @@
         return false;
     }
 
-    function hasBlockedScript(data) {
+    function hasBlockedOriginalScript(data) {
         return (
-            BLOCKED_SCRIPT_RE.test(text(data.original_title)) ||
-            BLOCKED_SCRIPT_RE.test(text(data.original_name))
+            BLOCKED_SCRIPT_RE.test(
+                string(data.original_title)
+            ) ||
+            BLOCKED_SCRIPT_RE.test(
+                string(data.original_name)
+            )
         );
     }
 
@@ -128,9 +151,6 @@
             return false;
         }
 
-        /*
-         * Оставляем только карточки с названием на кириллице.
-         */
         if (!hasCyrillicTitle(data)) {
             return true;
         }
@@ -138,20 +158,57 @@
         return (
             hasBlockedLanguage(data) ||
             hasBlockedCountry(data) ||
-            hasBlockedScript(data) ||
+            hasBlockedOriginalScript(data) ||
             hasAnimeWords(data)
         );
     }
 
-    function isFilteredCard(card) {
+    function getCardContainer(card) {
+        if (!card || !card.parentElement) {
+            return card;
+        }
+
+        var parent = card.parentElement;
+
+        /*
+         * Некоторые версии Lampa помещают карточку
+         * в отдельную обёртку. Скрываем именно её,
+         * чтобы она не занимала место в ряду.
+         */
+        if (
+            parent.children.length === 1 &&
+            (
+                parent.classList.contains('scroll__item') ||
+                parent.classList.contains('items-line__item') ||
+                parent.classList.contains('card-wrapper') ||
+                parent.classList.contains('selector')
+            )
+        ) {
+            return parent;
+        }
+
+        return card;
+    }
+
+    function hideCard(card) {
+        if (!card || card.__noAnimeHidden) {
+            return;
+        }
+
+        card.__noAnimeHidden = true;
+
+        var container = getCardContainer(card);
+
+        if (container) {
+            container.classList.add(HIDDEN_CLASS);
+        }
+    }
+
+    function shouldHideCard(card) {
         if (!card) {
             return false;
         }
 
-        /*
-         * ByLampa добавляет этот слой карточкам,
-         * которые сама помечает встроенным фильтром.
-         */
         if (
             card.querySelector &&
             card.querySelector('.card__filter')
@@ -162,224 +219,80 @@
         return isBlockedByData(card.card_data);
     }
 
-    function hideCard(card, reason) {
-        if (!card) {
+    function processCard(card) {
+        if (
+            !card ||
+            card.nodeType !== 1 ||
+            card.__noAnimeHidden
+        ) {
             return;
         }
-
-        card.classList.add(HIDDEN_CLASS);
-        card.dataset.noAnimeReason = reason || 'filtered';
-    }
-
-    function showCard(card) {
-        if (!card) {
-            return;
-        }
-
-        card.classList.remove(HIDDEN_CLASS);
-        delete card.dataset.noAnimeReason;
-    }
-
-    function getCardKey(card) {
-        var data = card && card.card_data;
-
-        if (!data || typeof data !== 'object') {
-            return '';
-        }
-
-        var type = data.original_name || data.first_air_date
-            ? 'tv'
-            : 'movie';
-
-        if (data.id !== undefined && data.id !== null) {
-            return type + ':' + data.id;
-        }
-
-        return [
-            type,
-            text(data.original_title || data.original_name),
-            text(data.release_date || data.first_air_date)
-        ].join(':');
-    }
-
-    function findRow(card) {
-        if (!card || !card.closest) {
-            return document.body;
-        }
-
-        return card.closest(
-            '.items-line,' +
-            '.category-full,' +
-            '.category,' +
-            '.scroll,' +
-            '.content,' +
-            '.activity'
-        ) || card.parentElement || document.body;
-    }
-
-    function findMoreButton(row) {
-        if (!row || !row.querySelectorAll) {
-            return null;
-        }
-
-        var candidates = row.querySelectorAll(
-            '.items-line__more,' +
-            '.category-full__more,' +
-            '.selector,' +
-            '.button,' +
-            '[data-action="more"],' +
-            '[class*="more"]'
-        );
-
-        for (var i = 0; i < candidates.length; i++) {
-            var candidate = candidates[i];
-
-            if (
-                candidate.classList &&
-                candidate.classList.contains('card')
-            ) {
-                continue;
-            }
-
-            var label = text(
-                candidate.innerText ||
-                candidate.textContent
-            ).trim().toLowerCase();
-
-            if (
-                label === 'ещё' ||
-                label === 'еще' ||
-                label === 'more'
-            ) {
-                return candidate;
-            }
-        }
-
-        return null;
-    }
-
-    function requestMore(row, hiddenCount) {
-        if (!row || hiddenCount === 0) {
-            return;
-        }
-
-        if (row.__noAnimeLoadingMore) {
-            return;
-        }
-
-        var attempts = row.__noAnimeLoadAttempts || 0;
 
         /*
-         * Ограничиваем количество автоматических подгрузок,
-         * чтобы не получить бесконечный цикл.
+         * card_data может появиться немного позже,
+         * чем сама карточка.
          */
-        if (attempts >= 5) {
-            return;
-        }
+        if (
+            !card.card_data &&
+            !card.querySelector('.card__filter')
+        ) {
+            if (!card.__noAnimeRetry) {
+                card.__noAnimeRetry = true;
 
-        var button = findMoreButton(row);
-
-        if (!button) {
-            return;
-        }
-
-        row.__noAnimeLoadingMore = true;
-        row.__noAnimeLoadAttempts = attempts + 1;
-
-        setTimeout(function () {
-            try {
-                button.dispatchEvent(
-                    new MouseEvent('click', {
-                        bubbles: true,
-                        cancelable: true,
-                        view: window
-                    })
-                );
-            } catch (error) {
-                if (typeof button.click === 'function') {
-                    button.click();
-                }
+                setTimeout(function () {
+                    card.__noAnimeRetry = false;
+                    queueCard(card);
+                }, 80);
             }
 
-            setTimeout(function () {
-                row.__noAnimeLoadingMore = false;
-                queueRow(row);
-            }, 500);
-        }, 50);
-    }
-
-    function processRow(row) {
-        if (!row || !row.querySelectorAll) {
             return;
         }
 
-        var cards = row.querySelectorAll('.card');
-        var seen = Object.create(null);
-        var hiddenCount = 0;
+        if (shouldHideCard(card)) {
+            hideCard(card);
+        }
+    }
+
+    function flushQueue() {
+        frameScheduled = false;
+
+        var cards = pendingCards;
+
+        pendingCards = [];
+        pendingSet = new WeakSet();
 
         for (var i = 0; i < cards.length; i++) {
-            var card = cards[i];
-
-            /*
-             * Не отмечаем карточку навсегда проверенной:
-             * card_data или .card__filter могут появиться позже.
-             */
-            if (isFilteredCard(card)) {
-                hideCard(card, 'filtered');
-                hiddenCount++;
-                continue;
-            }
-
-            var key = getCardKey(card);
-
-            if (key && seen[key]) {
-                hideCard(card, 'duplicate');
-                hiddenCount++;
-                continue;
-            }
-
-            if (key) {
-                seen[key] = true;
-            }
-
-            showCard(card);
-        }
-
-        requestMore(row, hiddenCount);
-    }
-
-    function flushRows() {
-        frameRequested = false;
-
-        var rows = Array.from(pendingRows);
-        pendingRows.clear();
-
-        for (var i = 0; i < rows.length; i++) {
-            processRow(rows[i]);
+            processCard(cards[i]);
         }
     }
 
-    function queueRow(row) {
-        if (!row) {
+    function queueCard(card) {
+        if (
+            !card ||
+            card.nodeType !== 1 ||
+            card.__noAnimeHidden ||
+            pendingSet.has(card)
+        ) {
             return;
         }
 
-        pendingRows.add(row);
+        pendingSet.add(card);
+        pendingCards.push(card);
 
-        if (frameRequested) {
+        if (frameScheduled) {
             return;
         }
 
-        frameRequested = true;
+        frameScheduled = true;
 
         if (typeof requestAnimationFrame === 'function') {
-            requestAnimationFrame(flushRows);
+            requestAnimationFrame(flushQueue);
         } else {
-            setTimeout(flushRows, 0);
+            setTimeout(flushQueue, 0);
         }
     }
 
-    function scanNode(node) {
+    function processAddedNode(node) {
         if (!node || node.nodeType !== 1) {
             return;
         }
@@ -388,19 +301,17 @@
             node.classList &&
             node.classList.contains('card')
         ) {
-            queueRow(findRow(node));
+            queueCard(node);
         }
 
         if (
             node.classList &&
             node.classList.contains('card__filter')
         ) {
-            var owner = node.closest
-                ? node.closest('.card')
-                : null;
+            var ownerCard = node.closest('.card');
 
-            if (owner) {
-                queueRow(findRow(owner));
+            if (ownerCard) {
+                queueCard(ownerCard);
             }
         }
 
@@ -411,17 +322,27 @@
         var cards = node.querySelectorAll('.card');
 
         for (var i = 0; i < cards.length; i++) {
-            queueRow(findRow(cards[i]));
+            queueCard(cards[i]);
+        }
+
+        var filters = node.querySelectorAll('.card__filter');
+
+        for (var j = 0; j < filters.length; j++) {
+            var card = filters[j].closest('.card');
+
+            if (card) {
+                queueCard(card);
+            }
         }
     }
 
     function start() {
         installStyles();
 
-        var existingCards = document.querySelectorAll('.card');
+        var cards = document.querySelectorAll('.card');
 
-        for (var i = 0; i < existingCards.length; i++) {
-            queueRow(findRow(existingCards[i]));
+        for (var i = 0; i < cards.length; i++) {
+            queueCard(cards[i]);
         }
 
         var observer = new MutationObserver(function (mutations) {
@@ -433,20 +354,9 @@
                     j < mutation.addedNodes.length;
                     j++
                 ) {
-                    scanNode(mutation.addedNodes[j]);
-                }
-
-                if (
-                    mutation.target &&
-                    mutation.target.nodeType === 1
-                ) {
-                    var card = mutation.target.closest
-                        ? mutation.target.closest('.card')
-                        : null;
-
-                    if (card) {
-                        queueRow(findRow(card));
-                    }
+                    processAddedNode(
+                        mutation.addedNodes[j]
+                    );
                 }
             }
         });
